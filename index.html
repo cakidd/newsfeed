@@ -1,114 +1,128 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>The Commons Community Feed</title>
+    <title>The Commons Feed</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://js.arcgis.com/4.28/"></script>
     <style>
-        .feed-container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            font-family: Arial, sans-serif;
-        }
-        .feed-item {
-            background: #fff;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 15px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .feed-item img {
-            max-width: 100%;
-            height: auto;
-            border-radius: 4px;
-            margin-top: 10px;
-        }
-        .feed-author {
-            font-weight: bold;
-            color: #2c4f90;
-        }
-        .feed-timestamp {
-            color: #666;
-            font-size: 0.9em;
-        }
-        .error {
-            color: red;
-            text-align: center;
-            padding: 20px;
-        }
+        /* Your existing CSS */
     </style>
 </head>
 <body>
-    <div class="feed-container" id="feed"></div>
+    <div class="feed-container" id="feed">
+        <div class="loader"></div>
+    </div>
 
     <script>
-        // Configuration - REPLACE WITH YOUR ACTUAL URL
-        const config = {
-            featureLayerUrl: "https://services7.arcgis.com/glzyAmcOgJqIUWmg/arcgis/rest/services/service_9a9cf88c4584462f9286b85b7c30038b/FeatureServer/0"
-        };
+        require(["esri/config", "esri/identity/IdentityManager", "esri/request"], 
+        (esriConfig, esriId, esriRequest) => {
+            
+            // ======== SERVICE CONFIGURATION ========
+            const MAIN_LAYER_URL = "https://services7.arcgis.com/glzyAmcOgJqIUWmg/arcgis/rest/services/service_f2459b3aa83c4162a52c6370048b72ea/FeatureServer/0";
+            const BUSINESS_PHOTOS2_URL = "https://services7.arcgis.com/glzyAmcOgJqIUWmg/arcgis/rest/services/service_f2459b3aa83c4162a52c6370048b72ea/FeatureServer/3";
 
-        // Fetch attachments for a feature
-        async function getFirstAttachmentUrl(objectId) {
-            try {
-                const response = await fetch(`${config.featureLayerUrl}/${objectId}/attachments?f=json`);
-                const data = await response.json();
-                if (data.attachmentInfos?.length > 0) {
-                    return `${config.featureLayerUrl}/${objectId}/attachments/${data.attachmentInfos[0].id}`;
+            // ======== AUTHENTICATION HANDLER ========
+            esriConfig.request.interceptors.push({
+                urls: /services7.arcgis.com/,
+                before: async (params) => {
+                    const token = await esriId.getToken(MAIN_LAYER_URL);
+                    if(token) params.requestOptions.query.token = token;
+                    return params;
                 }
-                return null;
-            } catch (error) {
-                console.error("Attachment error:", error);
-                return null;
-            }
-        }
+            });
 
-        // Load and display feed
-        async function loadFeed() {
-            try {
-                const response = await fetch(`${config.featureLayerUrl}/query?where=1=1&outFields=*&orderByFields=CreatedDate DESC&f=json`);
-                const data = await response.json();
+            // ======== CORE FUNCTIONALITY ========
+            async function loadFeed() {
                 const feed = document.getElementById("feed");
+                try {
+                    feed.innerHTML = '<div class="loader"></div>';
 
-                // Clear loading state
-                feed.innerHTML = "";
+                    // 1. Get main features with CORRECT FIELD NAME (globalid)
+                    const { data: mainData } = await esriRequest(`${MAIN_LAYER_URL}/query`, {
+                        query: {
+                            where: "1=1",
+                            outFields: "globalid,name,address,CreationDate", // lowercase globalid
+                            orderByFields: "CreationDate%20DESC", // URL-encoded space
+                            f: "json"
+                        }
+                    });
 
-                // Process each feature
-                for (const feature of data.features) {
-                    const attributes = feature.attributes;
-                    const feedItem = document.createElement("div");
-                    feedItem.className = "feed-item";
+                    if (!mainData.features?.length) {
+                        feed.innerHTML = '<div class="feed-item">🌟 No listings found</div>';
+                        return;
+                    }
 
-                    // Get first attachment
-                    const imageUrl = await getFirstAttachmentUrl(attributes.OBJECTID);
+                    feed.innerHTML = '';
+                    
+                    // 2. Process each feature
+                    for(const feature of mainData.features) {
+                        const globalId = feature.attributes.globalid; // lowercase
+                        if(!globalId) continue;
 
-                    // Build HTML
-                    feedItem.innerHTML = `
-                        <div class="feed-author">${attributes.Name || "Anonymous"}</div>
-                        <div class="feed-timestamp">
-                            ${new Date(attributes.CreatedDate).toLocaleDateString()} 
-                            ${new Date(attributes.CreatedDate).toLocaleTimeString()}
-                        </div>
-                        <p>${attributes.Comment || "No comment provided"}</p>
-                        ${imageUrl ? `<img src="${imageUrl}" alt="Submission photo">` : ""}
-                    `;
+                        // 3. Query business_photos2 table
+                        try {
+                            const { data: relatedData } = await esriRequest(`${BUSINESS_PHOTOS2_URL}/query`, {
+                                query: {
+                                    where: `ParentGlobalID='${globalId}'`,
+                                    outFields: "OBJECTID",
+                                    f: "json"
+                                }
+                            });
 
-                    feed.appendChild(feedItem);
+                            // 4. Get attachments
+                            const photos = [];
+                            for(const rel of relatedData.features) {
+                                try {
+                                    const { data: attachments } = await esriRequest(
+                                        `${BUSINESS_PHOTOS2_URL}/${rel.attributes.OBJECTID}/attachments?f=json`
+                                    );
+                                    photos.push(...attachments.attachmentInfos.map(a => 
+                                        `${BUSINESS_PHOTOS2_URL}/${rel.attributes.OBJECTID}/attachments/${a.id}`
+                                    ));
+                                } catch(error) {
+                                    console.warn("Attachment error:", error);
+                                }
+                            }
+
+                            // 5. Build card
+                            if(photos.length) {
+                                const card = document.createElement('div');
+                                card.className = 'feed-item';
+                                card.innerHTML = `
+                                    <div class="feed-header">
+                                        <div class="feed-avatar">${feature.attributes.name?.charAt(0) || '🏠'}</div>
+                                        <div>
+                                            <div class="feed-author">${feature.attributes.name || 'Community Member'}</div>
+                                            <div class="feed-meta">
+                                                ${new Date(feature.attributes.CreationDate).toLocaleDateString()}
+                                                ${feature.attributes.address ? `• ${feature.attributes.address}` : ''}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="feed-photos">
+                                        ${photos.map(url => `
+                                            <img class="feed-photo" 
+                                                src="${encodeURI(url)}" 
+                                                loading="lazy"
+                                                onerror="this.style.display='none'">
+                                        `).join('')}
+                                    </div>
+                                `;
+                                feed.appendChild(card);
+                            }
+                        } catch(error) {
+                            console.error("Related table error:", error);
+                        }
+                    }
+
+                } catch(error) {
+                    console.error("Feed Error:", error);
+                    feed.innerHTML = '<div class="feed-item">❌ Error loading feed</div>';
                 }
-
-            } catch (error) {
-                console.error("Feed load error:", error);
-                document.getElementById("feed").innerHTML = `
-                    <div class="error">
-                        ⚠️ Failed to load feed. Verify:<br>
-                        1. Feature layer is shared publicly<br>
-                        2. CORS is enabled on your server
-                    </div>
-                `;
             }
-        }
 
-        // Initialize
-        loadFeed();
+            loadFeed();
+        });
     </script>
 </body>
 </html>
